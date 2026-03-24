@@ -1,0 +1,31 @@
+{
+  "name": "my-telegram-summarizer",
+  "version": "1.0.0",
+  "description": "Daily and weekly Telegram message summarizer powered by GramJS, Telegraf, and Gemini 2.5 Flash.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "session": "node get_session.js",
+    "check": "node --check main.js && node --check bot.js && node --check get_session.js && node --check prompts.js"
+  },
+  "keywords": [
+    "telegram",
+    "gramjs",
+    "gemini",
+    "summarizer",
+    "telegraf"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@google/genai": "^1.46.0",
+    "@inquirer/prompts": "^8.3.2",
+    "dotenv": "^17.3.1",
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.22"
+  }
+}

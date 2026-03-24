@@ -1,0 +1,23 @@
+{
+  "1234567": {
+    "chat_info": {
+      "type": "Private chat",
+      "title": "Ilyos Kursdosh",
+      "username": "@ilyosbek",
+      "is_bot": false,
+      "is_mine": false
+    },
+    "101": "Interview opportunity for a frontend role next week.",
+    "102": "The startup team shared feedback on the MVP landing page."
+  },
+  "-1009876543210": {
+    "chat_info": {
+      "type": "Group",
+      "title": "Product Builders",
+      "username": "",
+      "is_bot": false,
+      "is_mine": true
+    },
+    "991": "I shared notes about optimizing Gemini token usage for daily summaries."
+  }
+}
