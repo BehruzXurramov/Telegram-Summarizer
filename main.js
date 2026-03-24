@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { GoogleGenAI } from "@google/genai";
 import { Api, TelegramClient } from "telegram";
-import { NewMessage } from "telegram/events/NewMessage";
+import { NewMessage } from "telegram/events/NewMessage.js";
 import { StringSession } from "telegram/sessions/index.js";
 import { createControlBot } from "./bot.js";
 import {
