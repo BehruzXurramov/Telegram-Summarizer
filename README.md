@@ -2,6 +2,8 @@
 
 A private Telegram summarizer that listens to your own account with GramJS, builds daily and weekly summaries with Gemini 2.5 Flash, and delivers the results through a private Telegram bot.
 
+*This project is open to improvements and fresh ideas. If you build a better version, feel free to fork it, improve it, and open a pull request. I would be happy to review and merge useful contributions. And if you like the project, giving it a star would mean a lot.*
+
 ## Highlights
 
 - Stable runtime with guarded async flows and global error reporting

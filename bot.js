@@ -14,7 +14,7 @@ const OWNER_WELCOME_MESSAGE = [
 ].join("\n");
 
 const UNAUTHORIZED_MESSAGE =
-  "This bot is private and only available to the project owner.";
+  "This bot is private and only available to the project owner. You can create your own copy here: https://github.com/BehruzXurramov/Telegram-Summarizer";
 
 function splitIntoChunks(text, maxLength = TELEGRAM_MESSAGE_LIMIT) {
   if (!text) {
