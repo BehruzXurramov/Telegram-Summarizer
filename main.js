@@ -12,9 +12,17 @@ import {
 
 const SCHEDULE_POLL_INTERVAL_MS = 30_000;
 const TELEGRAM_CONNECTION_RETRIES = 5;
+const TELEGRAM_CONNECTION_MAX_RETRIES = 10;
+const TELEGRAM_CONNECTION_BASE_DELAY_MS = 5_000;
+const TELEGRAM_CONNECTION_MAX_DELAY_MS = 60_000;
 const PARTIAL_FLUSH_CHARACTER_LIMIT = 120_000;
+const BUFFER_HARD_CAP_CHARACTERS = 500_000;
 const AI_RETRY_ATTEMPTS = 3;
-const AI_RETRY_DELAY_MS = 2_500;
+const AI_RETRY_DELAY_MS = 15_000;
+const AI_DAILY_REQUEST_LIMIT = 16;
+const ERROR_REPORT_WINDOW_MS = 60_000;
+const ERROR_REPORT_MAX_PER_WINDOW = 5;
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 const DAILY_SCHEDULE = { hour: 21, minute: 0 };
 const WEEKLY_SCHEDULE = { weekday: "Sun", hour: 21, minute: 5 };
 
@@ -62,11 +70,17 @@ const state = {
   flushQueued: false,
   schedulerHandle: null,
   shuttingDown: false,
+  errorReportTimestamps: [],
+  aiDailyRequestCount: 0,
+  aiDailyRequestResetKey: null,
   stats: {
     capturedMessages: 0,
     partialFlushes: 0,
     aiRequests: 0,
+    aiRequestsSkipped: 0,
     errorCount: 0,
+    errorsSuppressed: 0,
+    messagesDropped: 0,
   },
   schedulerState: {
     lastDailyRunKey: null,
@@ -155,6 +169,21 @@ function formatError(error) {
   };
 }
 
+function isErrorReportingAllowed() {
+  const now = Date.now();
+
+  state.errorReportTimestamps = state.errorReportTimestamps.filter(
+    (ts) => now - ts < ERROR_REPORT_WINDOW_MS,
+  );
+
+  if (state.errorReportTimestamps.length >= ERROR_REPORT_MAX_PER_WINDOW) {
+    return false;
+  }
+
+  state.errorReportTimestamps.push(now);
+  return true;
+}
+
 async function reportError(error, context) {
   state.stats.errorCount += 1;
 
@@ -162,6 +191,14 @@ async function reportError(error, context) {
   const consoleMessage = `[${new Date().toISOString()}] ${context}\n${details.name}: ${details.message}\n${details.stack}`;
 
   console.error(consoleMessage);
+
+  if (!isErrorReportingAllowed()) {
+    state.stats.errorsSuppressed += 1;
+    console.warn(
+      `[${new Date().toISOString()}] Error notification suppressed (rate limit). Total suppressed: ${state.stats.errorsSuppressed}`,
+    );
+    return;
+  }
 
   await controlBot.notifyError({
     context,
@@ -228,10 +265,33 @@ function formatDuration(ms) {
   return `${hours}h ${minutes}m ${seconds}s`;
 }
 
+function checkAndIncrementAiBudget() {
+  const todayKey = getTimeZoneParts(new Date()).dateKey;
+
+  if (state.aiDailyRequestResetKey !== todayKey) {
+    state.aiDailyRequestResetKey = todayKey;
+    state.aiDailyRequestCount = 0;
+  }
+
+  if (state.aiDailyRequestCount >= AI_DAILY_REQUEST_LIMIT) {
+    return false;
+  }
+
+  state.aiDailyRequestCount += 1;
+  return true;
+}
+
 async function generateTextWithRetry(prompt, reason) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= AI_RETRY_ATTEMPTS; attempt += 1) {
+    if (!checkAndIncrementAiBudget()) {
+      state.stats.aiRequestsSkipped += 1;
+      throw new Error(
+        `Daily AI request limit reached (${AI_DAILY_REQUEST_LIMIT}/${AI_DAILY_REQUEST_LIMIT}). Skipping: ${reason}`,
+      );
+    }
+
     try {
       state.stats.aiRequests += 1;
 
@@ -391,6 +451,7 @@ async function runWeeklySummary(trigger) {
 
   state.weeklyDailySummaries = [];
   state.weeklyCharacterCount = 0;
+  state.chatInfoCache.clear();
 }
 
 function buildStatusReport() {
@@ -408,9 +469,14 @@ function buildStatusReport() {
     `Daily partial summaries: ${state.dailyPartialSummaries.length}`,
     `Weekly stored daily summaries: ${state.weeklyDailySummaries.length}`,
     `Captured messages: ${state.stats.capturedMessages}`,
+    `Messages dropped (buffer cap): ${state.stats.messagesDropped}`,
     `Partial flushes: ${state.stats.partialFlushes}`,
-    `AI requests: ${state.stats.aiRequests}`,
+    `AI requests today: ${state.aiDailyRequestCount}/${AI_DAILY_REQUEST_LIMIT}`,
+    `AI requests total: ${state.stats.aiRequests}`,
+    `AI requests skipped (limit): ${state.stats.aiRequestsSkipped}`,
     `Errors observed: ${state.stats.errorCount}`,
+    `Error notifications suppressed: ${state.stats.errorsSuppressed}`,
+    `Cached chats: ${state.chatInfoCache.size}`,
   ].join("\n");
 }
 
@@ -420,6 +486,12 @@ async function handleIncomingMessage(event) {
     const text = message?.message?.trim();
 
     if (!text) {
+      return;
+    }
+
+    // Drop messages if the buffer is extremely large (AI flush failures).
+    if (getBufferCharacterCount() >= BUFFER_HARD_CAP_CHARACTERS) {
+      state.stats.messagesDropped += 1;
       return;
     }
 
@@ -481,20 +553,37 @@ async function checkSchedules() {
 }
 
 async function connectTelegramClient() {
-  let connected = false;
-
-  while (!connected && !state.shuttingDown) {
+  for (
+    let attempt = 1;
+    attempt <= TELEGRAM_CONNECTION_MAX_RETRIES && !state.shuttingDown;
+    attempt += 1
+  ) {
     try {
       await telegramClient.connect();
       // Keep the account from looking artificially active just because the
       // summarizer process is connected in the background.
       await telegramClient.invoke(new Api.account.UpdateStatus({ offline: true }));
-      connected = true;
+      return true;
     } catch (error) {
-      await reportError(error, "Connecting the Telegram user client");
-      await sleep(5_000);
+      await reportError(
+        error,
+        `Connecting the Telegram user client (attempt ${attempt}/${TELEGRAM_CONNECTION_MAX_RETRIES})`,
+      );
+
+      if (attempt < TELEGRAM_CONNECTION_MAX_RETRIES) {
+        const delay = Math.min(
+          TELEGRAM_CONNECTION_BASE_DELAY_MS * 2 ** (attempt - 1),
+          TELEGRAM_CONNECTION_MAX_DELAY_MS,
+        );
+        await sleep(delay);
+      }
     }
   }
+
+  console.error(
+    `[${new Date().toISOString()}] Exhausted all ${TELEGRAM_CONNECTION_MAX_RETRIES} connection attempts. Exiting.`,
+  );
+  process.exit(1);
 }
 
 async function launchBot() {
@@ -511,6 +600,15 @@ async function shutdown(signal) {
   }
 
   state.shuttingDown = true;
+
+  // Force-kill the process if graceful cleanup hangs.
+  const forceExitTimer = setTimeout(() => {
+    console.error(
+      `[${new Date().toISOString()}] Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms. Forcing exit.`,
+    );
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceExitTimer.unref();
 
   if (state.schedulerHandle) {
     clearInterval(state.schedulerHandle);
@@ -534,6 +632,8 @@ async function shutdown(signal) {
   } catch (error) {
     await reportError(error, "Stopping the Telegram control bot");
   }
+
+  process.exit(0);
 }
 
 process.on("unhandledRejection", (error) => {
@@ -541,7 +641,9 @@ process.on("unhandledRejection", (error) => {
 });
 
 process.on("uncaughtException", (error) => {
-  void reportError(error, "Uncaught exception");
+  void reportError(error, "Uncaught exception").finally(() => {
+    void shutdown("uncaughtException");
+  });
 });
 
 process.on("SIGINT", () => {
@@ -553,8 +655,16 @@ process.on("SIGTERM", () => {
 });
 
 async function start() {
+  if (state.shuttingDown) {
+    return;
+  }
+
   await launchBot();
-  await connectTelegramClient();
+  const telegramConnected = await connectTelegramClient();
+
+  if (!telegramConnected || state.shuttingDown) {
+    return;
+  }
 
   // The GramJS client listens passively; outgoing summary work is handled by
   // the separate control bot.

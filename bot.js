@@ -181,9 +181,22 @@ export function createControlBot({
       { command: "ping", description: "Quick bot liveness check" },
     ]);
 
-    await bot.launch({
+    // bot.launch() starts long-polling internally.  We intentionally do NOT
+    // await it because the returned promise only settles when polling stops
+    // (i.e. on shutdown), which would block the rest of the startup sequence.
+    // Errors are forwarded to the console so they are never silently swallowed.
+    bot.launch({
       dropPendingUpdates: true,
+    }).catch((error) => {
+      console.error(
+        `[${new Date().toISOString()}] [ERROR] Telegraf polling crashed:`,
+        error,
+      );
     });
+
+    // Give Telegraf a moment to delete the webhook and start its first poll
+    // cycle so the bot is responsive by the time we continue.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
 
   async function stop(reason = "stop") {
