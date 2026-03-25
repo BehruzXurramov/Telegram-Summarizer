@@ -27,6 +27,7 @@ INPUT FORMAT:
 - Each chat contains:
   - chat_info
   - message_id: message_text pairs
+- Messages starting with [ME] were sent by the user themselves. Use this to distinguish what the user said from what others said.
 
 TASK:
 - Extract only the meaningful information.

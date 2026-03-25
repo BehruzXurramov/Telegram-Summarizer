@@ -333,7 +333,6 @@ async function getChatInfoSnapshot(message) {
     title: "Unknown chat",
     username: "",
     is_bot: false,
-    is_mine: Boolean(message.out),
   };
 
   try {
@@ -347,7 +346,6 @@ async function getChatInfoSnapshot(message) {
           .trim() || fallbackChatInfo.title,
       username: chat?.username ? `@${chat.username}` : "",
       is_bot: Boolean(chat?.bot),
-      is_mine: Boolean(message.out),
     };
 
     state.chatInfoCache.set(chatId, snapshot);
@@ -503,7 +501,8 @@ async function handleIncomingMessage(event) {
       };
     }
 
-    state.dailyMessageBuffer[chatId][String(message.id)] = text;
+    state.dailyMessageBuffer[chatId][String(message.id)] =
+      message.out ? `[ME] ${text}` : text;
     state.stats.capturedMessages += 1;
 
     if (
