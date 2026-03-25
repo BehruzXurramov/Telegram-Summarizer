@@ -26,6 +26,7 @@ const SUMMARY_RETRY_DELAY_MS = {
   daily: 15 * 60_000,
   weekly: 30 * 60_000,
 };
+const IGNORED_CHAT_IDS = new Set(["8621210301"]);
 const DAILY_SCHEDULE = { hour: 21, minute: 0 };
 const WEEKLY_SCHEDULE = { weekday: "Sun", hour: 21, minute: 5 };
 
@@ -663,6 +664,10 @@ async function handleIncomingMessage(event) {
     }
 
     const chatId = String(message.chatId);
+
+    if (IGNORED_CHAT_IDS.has(chatId)) {
+      return;
+    }
 
     if (!state.dailyMessageBuffer[chatId]) {
       state.dailyMessageBuffer[chatId] = {
