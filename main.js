@@ -11,18 +11,21 @@ import {
 } from "./prompts.js";
 
 const SCHEDULE_POLL_INTERVAL_MS = 30_000;
-const TELEGRAM_CONNECTION_RETRIES = 5;
 const TELEGRAM_CONNECTION_MAX_RETRIES = 10;
 const TELEGRAM_CONNECTION_BASE_DELAY_MS = 5_000;
 const TELEGRAM_CONNECTION_MAX_DELAY_MS = 60_000;
 const PARTIAL_FLUSH_CHARACTER_LIMIT = 120_000;
 const BUFFER_HARD_CAP_CHARACTERS = 500_000;
 const AI_RETRY_ATTEMPTS = 3;
-const AI_RETRY_DELAY_MS = 15_000;
+const AI_RETRY_DELAY_MS = 30_000;
 const AI_DAILY_REQUEST_LIMIT = 16;
 const ERROR_REPORT_WINDOW_MS = 60_000;
 const ERROR_REPORT_MAX_PER_WINDOW = 5;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+const SUMMARY_RETRY_DELAY_MS = {
+  daily: 15 * 60_000,
+  weekly: 30 * 60_000,
+};
 const DAILY_SCHEDULE = { hour: 21, minute: 0 };
 const WEEKLY_SCHEDULE = { weekday: "Sun", hour: 21, minute: 5 };
 
@@ -86,6 +89,20 @@ const state = {
     lastDailyRunKey: null,
     lastWeeklyRunKey: null,
   },
+  summaryJobs: {
+    daily: {
+      queued: false,
+      running: false,
+      retryAt: null,
+      retryTimeout: null,
+    },
+    weekly: {
+      queued: false,
+      running: false,
+      retryAt: null,
+      retryTimeout: null,
+    },
+  },
 };
 
 const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
@@ -95,7 +112,7 @@ const telegramClient = new TelegramClient(
   config.apiId,
   config.apiHash,
   {
-    connectionRetries: TELEGRAM_CONNECTION_RETRIES,
+    connectionRetries: 5,
   },
 );
 
@@ -103,23 +120,25 @@ const controlBot = createControlBot({
   token: config.botToken,
   ownerTelegramId: config.ownerTelegramId,
   onStatusRequested: buildStatusReport,
-  onDailySummaryRequested: () =>
-    enqueueWorkflow("manual daily summary", async () => {
-      await runDailySummary("manual");
-      return "Daily summary request completed.";
-    }),
-  onWeeklySummaryRequested: () =>
-    enqueueWorkflow("manual weekly summary", async () => {
-      await runWeeklySummary("manual");
-      return "Weekly summary request completed.";
-    }),
-  onFlushRequested: () =>
-    enqueueWorkflow("manual buffer flush", async () => {
-      const summary = await flushCurrentBufferToPartialSummary("manual flush");
+  onDailySummaryRequested: () => requestSummaryRun("daily", "manual"),
+  onWeeklySummaryRequested: () => requestSummaryRun("weekly", "manual"),
+  onFlushRequested: async () => {
+    try {
+      const summary = await enqueueWorkflow("manual buffer flush", async () => {
+        return flushCurrentBufferToPartialSummary("manual flush");
+      });
+
       return summary
         ? "Current message buffer was summarized into an intermediate daily chunk."
         : "There were no buffered messages to summarize.";
-  }),
+    } catch (error) {
+      if (error instanceof GeminiTemporaryUnavailableError) {
+        return "Gemini is busy right now. The buffer was kept in memory and can be retried later.";
+      }
+
+      throw error;
+    }
+  },
 });
 
 function sleep(ms) {
@@ -169,6 +188,65 @@ function formatError(error) {
   };
 }
 
+class GeminiTemporaryUnavailableError extends Error {
+  constructor(reason, details) {
+    super(`Gemini is temporarily unavailable for ${reason}: ${details}`);
+    this.name = "GeminiTemporaryUnavailableError";
+    this.reason = reason;
+    this.details = details;
+  }
+}
+
+function isGeminiTemporaryUnavailable(error) {
+  const details = formatError(error);
+  const message = details.message || "";
+
+  return (
+    message.includes('"code":503') ||
+    message.includes('"status":"UNAVAILABLE"') ||
+    message.includes("currently experiencing high demand") ||
+    message.includes("temporarily overloaded")
+  );
+}
+
+function getSummaryJobState(jobName) {
+  return state.summaryJobs[jobName];
+}
+
+function formatRetryTime(date) {
+  const parts = getTimeZoneParts(date);
+  return `${parts.dateKey} ${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
+}
+
+function clearSummaryRetry(jobName) {
+  const job = getSummaryJobState(jobName);
+
+  if (job.retryTimeout) {
+    clearTimeout(job.retryTimeout);
+    job.retryTimeout = null;
+  }
+
+  job.retryAt = null;
+}
+
+function describeSummaryJob(jobName) {
+  const job = getSummaryJobState(jobName);
+
+  if (job.running) {
+    return "running";
+  }
+
+  if (job.queued) {
+    return "queued";
+  }
+
+  if (job.retryAt) {
+    return `retry scheduled for ${formatRetryTime(job.retryAt)}`;
+  }
+
+  return "idle";
+}
+
 function isErrorReportingAllowed() {
   const now = Date.now();
 
@@ -213,6 +291,13 @@ function enqueueWorkflow(label, task) {
   const run = state.workflow.then(task);
 
   state.workflow = run.catch(async (error) => {
+      if (error instanceof GeminiTemporaryUnavailableError) {
+        console.warn(
+          `[${new Date().toISOString()}] Temporary Gemini overload while running ${label}: ${error.details}`,
+        );
+        return;
+      }
+
       await reportError(error, `Workflow failure: ${label}`);
     });
 
@@ -316,6 +401,13 @@ async function generateTextWithRetry(prompt, reason) {
     }
   }
 
+  if (isGeminiTemporaryUnavailable(lastError)) {
+    throw new GeminiTemporaryUnavailableError(
+      reason,
+      formatError(lastError).message,
+    );
+  }
+
   throw new Error(
     `Gemini request failed for ${reason}: ${formatError(lastError).message}`,
   );
@@ -393,6 +485,81 @@ async function flushCurrentBufferToPartialSummary(reason) {
   }
 }
 
+function scheduleSummaryRetry(jobName, trigger) {
+  const job = getSummaryJobState(jobName);
+  const delay = SUMMARY_RETRY_DELAY_MS[jobName];
+
+  clearSummaryRetry(jobName);
+
+  const retryAt = new Date(Date.now() + delay);
+  job.retryAt = retryAt;
+  job.retryTimeout = setTimeout(() => {
+    job.retryTimeout = null;
+    job.retryAt = null;
+    void requestSummaryRun(jobName, `${trigger} retry`);
+  }, delay);
+  job.retryTimeout.unref?.();
+
+  return retryAt;
+}
+
+async function handleSummaryJobFailure(jobName, trigger, error) {
+  if (error instanceof GeminiTemporaryUnavailableError) {
+    const retryAt = scheduleSummaryRetry(jobName, trigger);
+
+    await controlBot.sendPlainText(
+      [
+        `Gemini is busy right now, so the ${jobName} summary was delayed.`,
+        `I will retry automatically at ${formatRetryTime(retryAt)}.`,
+        "Your buffered messages were kept in memory.",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  await reportError(error, `Workflow failure: ${trigger} ${jobName} summary`);
+}
+
+function requestSummaryRun(jobName, trigger) {
+  const job = getSummaryJobState(jobName);
+  const title = jobName[0].toUpperCase() + jobName.slice(1);
+
+  if (job.running) {
+    return `${title} summary is already running.`;
+  }
+
+  if (job.queued) {
+    return `${title} summary is already queued.`;
+  }
+
+  if (job.retryAt) {
+    return `${title} summary is already scheduled to retry at ${formatRetryTime(job.retryAt)}.`;
+  }
+
+  job.queued = true;
+
+  void enqueueWorkflow(`${trigger} ${jobName} summary`, async () => {
+    job.queued = false;
+    job.running = true;
+
+    try {
+      clearSummaryRetry(jobName);
+
+      if (jobName === "daily") {
+        await runDailySummary(trigger);
+      } else {
+        await runWeeklySummary(trigger);
+      }
+    } catch (error) {
+      await handleSummaryJobFailure(jobName, trigger, error);
+    } finally {
+      job.running = false;
+    }
+  });
+
+  return `${title} summary has been queued. I will send it here when it is ready.`;
+}
+
 async function runDailySummary(trigger) {
   let summaryText = "";
 
@@ -415,13 +582,13 @@ async function runDailySummary(trigger) {
     );
   }
 
-  if (state.dailyPartialSummaries.length > 0) {
-    state.weeklyDailySummaries.push(summaryText);
-  }
-
   await controlBot.sendReport(
     `${summaryText}\n\nDaily input characters: ${state.dailyCharacterCount}`,
   );
+
+  if (state.dailyPartialSummaries.length > 0) {
+    state.weeklyDailySummaries.push(summaryText);
+  }
 
   state.dailyPartialSummaries = [];
   state.dailyCharacterCount = 0;
@@ -466,6 +633,8 @@ function buildStatusReport() {
     `Buffered characters: ${getBufferCharacterCount()}`,
     `Daily partial summaries: ${state.dailyPartialSummaries.length}`,
     `Weekly stored daily summaries: ${state.weeklyDailySummaries.length}`,
+    `Daily summary job: ${describeSummaryJob("daily")}`,
+    `Weekly summary job: ${describeSummaryJob("weekly")}`,
     `Captured messages: ${state.stats.capturedMessages}`,
     `Messages dropped (buffer cap): ${state.stats.messagesDropped}`,
     `Partial flushes: ${state.stats.partialFlushes}`,
@@ -531,10 +700,7 @@ async function checkSchedules() {
     state.schedulerState.lastDailyRunKey !== now.dateKey
   ) {
     state.schedulerState.lastDailyRunKey = now.dateKey;
-
-    void enqueueWorkflow("scheduled daily summary", async () => {
-      await runDailySummary("schedule");
-    });
+    requestSummaryRun("daily", "schedule");
   }
 
   if (
@@ -544,10 +710,7 @@ async function checkSchedules() {
     state.schedulerState.lastWeeklyRunKey !== now.dateKey
   ) {
     state.schedulerState.lastWeeklyRunKey = now.dateKey;
-
-    void enqueueWorkflow("scheduled weekly summary", async () => {
-      await runWeeklySummary("schedule");
-    });
+    requestSummaryRun("weekly", "schedule");
   }
 }
 
@@ -659,9 +822,9 @@ async function start() {
   }
 
   await launchBot();
-  const telegramConnected = await connectTelegramClient();
+  await connectTelegramClient();
 
-  if (!telegramConnected || state.shuttingDown) {
+  if (state.shuttingDown) {
     return;
   }
 
@@ -687,4 +850,5 @@ async function start() {
 
 start().catch(async (error) => {
   await reportError(error, "Application startup");
+  process.exit(1);
 });

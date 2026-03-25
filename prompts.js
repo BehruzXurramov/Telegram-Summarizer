@@ -11,10 +11,12 @@ GENERAL RULES:
 - Do not expose raw JSON, chat IDs, or message IDs without context.
 - Avoid raw URLs in the visible text.
 - When referencing an important message, embed a single Telegram link naturally using:
-  [short label](https://t.me/c/<chat_id>/<message_id>)
-- Return Telegram MarkdownV2-compatible text when possible.
-- Escape Telegram MarkdownV2 special characters correctly.
-- If safe MarkdownV2 formatting becomes difficult, keep formatting minimal instead of producing broken markup.
+  <a href="https://t.me/c/<chat_id>/<message_id>">short label</a>
+- Return Telegram HTML parse-mode compatible text.
+- Use only Telegram-safe HTML tags such as <b>, <i>, <u>, <s>, <code>, <pre>, and <a>.
+- Escape plain-text angle brackets and ampersands when needed.
+- If rich formatting becomes difficult, prefer simple valid HTML over broken markup.
+- Prefer section headings wrapped in <b>...</b>.
 `;
 
 export function buildPartialSummaryPrompt(serializedMessages) {

@@ -1,7 +1,7 @@
 import { Telegraf } from "telegraf";
 
 const TELEGRAM_MESSAGE_LIMIT = 4096;
-const TELEGRAM_MARKDOWN_SAFE_LIMIT = 3900;
+const TELEGRAM_HTML_SAFE_LIMIT = 3900;
 
 const OWNER_WELCOME_MESSAGE = [
   "Telegram Summarizer is ready.",
@@ -57,6 +57,22 @@ function formatErrorNotification({ context, message, stack }) {
   ].join("\n");
 }
 
+function convertHtmlToPlainText(text) {
+  return text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<li>/gi, "- ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
 export function createControlBot({
   token,
   ownerTelegramId,
@@ -84,26 +100,24 @@ export function createControlBot({
       return;
     }
 
-    // We try MarkdownV2 first for nicer summaries, then fall back to plain text
-    // so formatting issues never block delivery.
-    if (text.length <= TELEGRAM_MARKDOWN_SAFE_LIMIT) {
+    // We try Telegram HTML first for readable formatting, then fall back to
+    // plain text so formatting issues never block delivery.
+    if (text.length <= TELEGRAM_HTML_SAFE_LIMIT) {
       try {
         await bot.telegram.sendMessage(ownerTelegramId, text, {
-          parse_mode: "MarkdownV2",
+          parse_mode: "HTML",
           disable_web_page_preview: true,
         });
         return;
       } catch (error) {
-        await notifyError({
-          context: "Sending MarkdownV2 report",
-          message:
-            error instanceof Error ? error.message : "Unknown Telegram send error",
-          stack: error instanceof Error ? error.stack : "No stack trace available.",
-        });
+        console.warn(
+          `[${new Date().toISOString()}] Failed to send HTML report, falling back to plain text:`,
+          error,
+        );
       }
     }
 
-    await sendPlainText(text);
+    await sendPlainText(convertHtmlToPlainText(text));
   }
 
   async function notifyError(errorDetails) {
